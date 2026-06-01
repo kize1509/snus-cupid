@@ -283,7 +283,7 @@ public sealed class CupidRegistry
             return RegistrationValidation.Invalid("Phone is required.");
         }
 
-        if (phone.StartsWith('-', StringComparison.Ordinal))
+        if (phone.StartsWith("-", StringComparison.Ordinal))
         {
             return RegistrationValidation.Invalid("Phone cannot be a negative number.");
         }

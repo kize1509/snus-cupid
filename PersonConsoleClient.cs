@@ -226,7 +226,7 @@ public static class PersonConsoleClient
                 continue;
             }
 
-            if (value.StartsWith('-', StringComparison.Ordinal))
+            if (value.StartsWith("-", StringComparison.Ordinal))
             {
                 Console.WriteLine("Phone cannot be a negative number.");
                 continue;
