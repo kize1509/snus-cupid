@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net.WebSockets;
 using System.Security.Cryptography;
 
 public sealed class CupidRegistry
@@ -12,7 +13,18 @@ public sealed class CupidRegistry
 
     private const string UninterestedMessage = "Nisam zainteresovan/a za upoznavanje.";
 
-    private readonly ConcurrentDictionary<string, PersonState> _people = new(StringComparer.OrdinalIgnoreCase);
+#pragma warning disable SYSLIB0023
+    private static readonly RandomNumberGenerator CryptoRandom = new RNGCryptoServiceProvider();
+#pragma warning restore SYSLIB0023
+
+    private readonly ConcurrentDictionary<Guid, PersonState> _peopleById = new();
+    private readonly ConcurrentDictionary<string, Guid> _personIdsByUsername = new(StringComparer.OrdinalIgnoreCase);
+    private readonly CupidPubSubHub _pubSubHub;
+
+    public CupidRegistry(CupidPubSubHub pubSubHub)
+    {
+        _pubSubHub = pubSubHub;
+    }
 
     public CupidApiResult<PersonDto> InitSinglePerson(RegisterPersonRequest request)
     {
@@ -23,187 +35,227 @@ public sealed class CupidRegistry
         }
 
         var person = new RegisteredPerson(
+            Guid.NewGuid(),
             validation.Username,
             validation.City,
             validation.Age,
             validation.Phone);
 
         var state = new PersonState(person);
-        if (!_people.TryAdd(person.NormalizedUsername, state))
+        if (!_personIdsByUsername.TryAdd(person.NormalizedUsername, person.Id))
         {
             return CupidApiResult<PersonDto>.Conflict("Username is already registered.");
         }
 
-        return CupidApiResult<PersonDto>.Created(state.ToDto());
+        if (!_peopleById.TryAdd(person.Id, state))
+        {
+            _personIdsByUsername.TryRemove(person.NormalizedUsername, out _);
+            return CupidApiResult<PersonDto>.Conflict("Person ID collision. Please try again.");
+        }
+
+        return CupidApiResult<PersonDto>.Created(ToDto(state));
     }
 
-    public IReadOnlyCollection<PersonDto> GetPeople()
+    public bool PersonExists(Guid personId)
     {
-        return _people.Values
-            .Select(person => person.ToDto())
-            .OrderBy(person => person.Username, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        return _peopleById.ContainsKey(personId);
     }
 
-    public CupidApiResult<PersonDto> GetPerson(string username)
+    public async Task SubscribeAsync(Guid personId, WebSocket socket, CancellationToken cancellationToken)
     {
-        if (!TryGetPerson(username, out var person))
+        if (!TryGetPerson(personId, out var person))
         {
-            return CupidApiResult<PersonDto>.NotFound("Person is not registered.");
+            await socket.CloseAsync(
+                WebSocketCloseStatus.PolicyViolation,
+                "Person is not registered.",
+                cancellationToken);
+            return;
         }
 
-        return CupidApiResult<PersonDto>.Ok(person.ToDto());
+        var pendingLetter = person.GetPendingLetter();
+        var initialEvents = pendingLetter is null
+            ? Array.Empty<PubSubEventDto>()
+            : new[] { CupidPubSubHub.CreateEvent(CupidEventTypes.LetterReceived, pendingLetter) };
+
+        await _pubSubHub.ConnectAsync(
+            personId,
+            socket,
+            initialEvents,
+            (message, token) => HandleSocketCommandAsync(personId, message, token),
+            cancellationToken);
     }
 
-    public async Task<CupidApiResult<LetterDto>> WaitForNextLetterAsync(
-        string username,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
+    public CupidApiResult<AcknowledgedLetterDto> AcknowledgeLetter(Guid personId, Guid letterId)
     {
-        if (!TryGetPerson(username, out var person))
+        if (!TryGetPerson(personId, out var person))
         {
-            return CupidApiResult<LetterDto>.NotFound("Person is not registered.");
+            return CupidApiResult<AcknowledgedLetterDto>.NotFound("Person is not registered.");
         }
 
-        var pending = person.GetPendingLetter();
-        if (pending is not null)
-        {
-            return CupidApiResult<LetterDto>.Ok(pending);
-        }
-
-        try
-        {
-            var letter = await person.WaitForLetterAsync(timeout, cancellationToken);
-            return letter is null
-                ? CupidApiResult<LetterDto>.NoContent()
-                : CupidApiResult<LetterDto>.Ok(letter);
-        }
-        catch (OperationCanceledException)
-        {
-            return CupidApiResult<LetterDto>.NoContent();
-        }
+        return person.AcknowledgeLetter(letterId, out var error)
+            ? CupidApiResult<AcknowledgedLetterDto>.Ok(new AcknowledgedLetterDto(letterId))
+            : CupidApiResult<AcknowledgedLetterDto>.Conflict(error ?? "Letter could not be acknowledged.");
     }
 
-    public CupidApiResult<object> AcknowledgeLetter(string username)
+    public CupidApiResult<BlockUserResponseDto> BlockUser(Guid personId, string blockedUsername)
     {
-        if (!TryGetPerson(username, out var person))
+        if (!TryGetPerson(personId, out var person))
         {
-            return CupidApiResult<object>.NotFound("Person is not registered.");
-        }
-
-        return person.AcknowledgeLetter()
-            ? CupidApiResult<object>.NoContent()
-            : CupidApiResult<object>.Conflict("There is no pending letter to acknowledge.");
-    }
-
-    public CupidApiResult<PersonDto> BlockUser(string username, string blockedUsername)
-    {
-        if (!TryGetPerson(username, out var person))
-        {
-            return CupidApiResult<PersonDto>.NotFound("Person is not registered.");
+            return CupidApiResult<BlockUserResponseDto>.NotFound("Person is not registered.");
         }
 
         if (!TryGetPerson(blockedUsername, out var blockedPerson))
         {
-            return CupidApiResult<PersonDto>.NotFound("Blocked person is not registered.");
+            return CupidApiResult<BlockUserResponseDto>.NotFound("Blocked person is not registered.");
         }
 
-        if (person.Person.NormalizedUsername == blockedPerson.Person.NormalizedUsername)
+        if (person.Person.Id == blockedPerson.Person.Id)
         {
-            return CupidApiResult<PersonDto>.BadRequest("A person cannot block themselves.");
+            return CupidApiResult<BlockUserResponseDto>.BadRequest("A person cannot block themselves.");
         }
 
-        person.Block(blockedPerson.Person.NormalizedUsername);
-        return CupidApiResult<PersonDto>.Ok(person.ToDto());
+        person.Block(blockedPerson.Person.Id);
+        return CupidApiResult<BlockUserResponseDto>.Ok(
+            new BlockUserResponseDto(blockedPerson.Person.Id, blockedPerson.Person.Username));
     }
 
-    public CupidTickResult SendLetters()
+    public Task<CupidTickResult> SendLettersAsync(CancellationToken cancellationToken = default)
     {
-        var people = _people.Values
+        var people = _peopleById.Values
             .Select(person => person.Snapshot())
             .OrderBy(person => person.Username, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        var attempts = new List<DeliveryAttemptDto>(people.Length);
         var delivered = 0;
 
         foreach (var recipient in people)
         {
-            if (!_people.TryGetValue(recipient.NormalizedUsername, out var recipientState))
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!_peopleById.TryGetValue(recipient.Id, out var recipientState))
             {
-                attempts.Add(new DeliveryAttemptDto(recipient.Username, null, null, false, "Recipient disappeared."));
                 continue;
             }
 
             if (recipientState.HasPendingLetter)
             {
-                attempts.Add(new DeliveryAttemptDto(recipient.Username, null, null, false, "Recipient has an unacknowledged letter."));
                 continue;
             }
 
             var match = FindBestMatch(recipient, people);
             if (match is null)
             {
-                attempts.Add(new DeliveryAttemptDto(recipient.Username, null, null, false, "No eligible sender."));
                 continue;
             }
 
             var message = PickMessage();
             var phoneVisible = message != UninterestedMessage;
             var letter = new LetterDto(
-                new PublicPersonDto(match.Sender.Username, match.Sender.City, match.Sender.Age),
+                Guid.NewGuid(),
+                DateTimeOffset.UtcNow,
+                new PublicPersonDto(match.Sender.Id, match.Sender.Username, match.Sender.City, match.Sender.Age),
                 message,
                 match.Score,
                 phoneVisible,
                 phoneVisible ? match.Sender.Phone : null);
 
-            if (recipientState.TryDeliverFrom(match.Sender.NormalizedUsername, letter))
+            if (recipientState.TryDeliverFrom(match.Sender.Id, letter))
             {
                 delivered++;
-                attempts.Add(new DeliveryAttemptDto(
-                    recipient.Username,
-                    match.Sender.Username,
-                    match.Score,
-                    true,
-                    "Delivered."));
-            }
-            else
-            {
-                attempts.Add(new DeliveryAttemptDto(
-                    recipient.Username,
-                    match.Sender.Username,
-                    match.Score,
-                    false,
-                    "Recipient became busy before delivery."));
+                _pubSubHub.Publish(recipient.Id, CupidPubSubHub.CreateEvent(CupidEventTypes.LetterReceived, letter));
             }
         }
 
-        return new CupidTickResult(DateTimeOffset.UtcNow, people.Length, delivered, attempts);
+        return Task.FromResult(new CupidTickResult(DateTimeOffset.UtcNow, people.Length, delivered));
+    }
+
+    private Task HandleSocketCommandAsync(
+        Guid personId,
+        ClientSocketMessage message,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        switch (message.Type?.Trim().ToLowerInvariant())
+        {
+            case CupidCommandTypes.AcknowledgeLetter:
+                HandleAcknowledgeCommand(personId, message);
+                break;
+
+            case CupidCommandTypes.BlockUser:
+                HandleBlockCommand(personId, message);
+                break;
+
+            default:
+                _pubSubHub.PublishError(personId, $"Unknown socket command '{message.Type}'.");
+                break;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void HandleAcknowledgeCommand(Guid personId, ClientSocketMessage message)
+    {
+        if (message.LetterId is null)
+        {
+            _pubSubHub.PublishError(personId, "Acknowledgement command must include letterId.");
+            return;
+        }
+
+        var result = AcknowledgeLetter(personId, message.LetterId.Value);
+        if (result.Error is not null)
+        {
+            _pubSubHub.PublishError(personId, result.Error);
+            return;
+        }
+
+        _pubSubHub.Publish(
+            personId,
+            CupidPubSubHub.CreateEvent(CupidEventTypes.LetterAcknowledged, result.Value));
+    }
+
+    private void HandleBlockCommand(Guid personId, ClientSocketMessage message)
+    {
+        if (string.IsNullOrWhiteSpace(message.Username))
+        {
+            _pubSubHub.PublishError(personId, "Block command must include username.");
+            return;
+        }
+
+        var result = BlockUser(personId, message.Username);
+        if (result.Error is not null)
+        {
+            _pubSubHub.PublishError(personId, result.Error);
+            return;
+        }
+
+        _pubSubHub.Publish(
+            personId,
+            CupidPubSubHub.CreateEvent(CupidEventTypes.UserBlocked, result.Value));
     }
 
     private MatchCandidate? FindBestMatch(RegisteredPerson recipient, IReadOnlyCollection<RegisteredPerson> people)
     {
+        if (!_peopleById.TryGetValue(recipient.Id, out var recipientState))
+        {
+            return null;
+        }
+
         MatchCandidate? best = null;
 
         foreach (var sender in people)
         {
-            if (sender.NormalizedUsername == recipient.NormalizedUsername)
+            if (sender.Id == recipient.Id)
             {
                 continue;
             }
 
-            if (!_people.TryGetValue(sender.NormalizedUsername, out var senderState))
+            if (!_peopleById.ContainsKey(sender.Id))
             {
                 continue;
             }
 
-            if (!_people.TryGetValue(recipient.NormalizedUsername, out var recipientState))
-            {
-                continue;
-            }
-
-            if (recipientState.HasBlocked(sender.NormalizedUsername) ||
-                senderState.HasBlocked(recipient.NormalizedUsername))
+            if (recipientState.HasBlocked(sender.Id))
             {
                 continue;
             }
@@ -220,7 +272,7 @@ public sealed class CupidRegistry
 
     private static int CalculateScore(RegisteredPerson recipient, RegisteredPerson sender)
     {
-        var score = RandomNumberGenerator.GetInt32(0, 101);
+        var score = GetCryptoRandomInt32(0, 101);
 
         if (string.Equals(recipient.City, sender.City, StringComparison.OrdinalIgnoreCase))
         {
@@ -237,19 +289,78 @@ public sealed class CupidRegistry
 
     private static string PickMessage()
     {
-        return LetterMessages[RandomNumberGenerator.GetInt32(0, LetterMessages.Length)];
+        return LetterMessages[GetCryptoRandomInt32(0, LetterMessages.Length)];
+    }
+
+    private static int GetCryptoRandomInt32(int minValue, int maxExclusive)
+    {
+        if (minValue >= maxExclusive)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxExclusive), "Maximum must be greater than minimum.");
+        }
+
+        var range = (uint)(maxExclusive - minValue);
+        var possibleValues = 1UL + uint.MaxValue;
+        var limit = possibleValues - possibleValues % range;
+        Span<byte> bytes = stackalloc byte[sizeof(uint)];
+
+        while (true)
+        {
+            lock (CryptoRandom)
+            {
+                CryptoRandom.GetBytes(bytes);
+            }
+
+            var value = BitConverter.ToUInt32(bytes);
+            if (value < limit)
+            {
+                return (int)(minValue + value % range);
+            }
+        }
+    }
+
+    private bool TryGetPerson(Guid personId, out PersonState person)
+    {
+        return _peopleById.TryGetValue(personId, out person!);
     }
 
     private bool TryGetPerson(string username, out PersonState person)
     {
         var normalized = Normalize(username);
-        if (normalized.Length == 0)
+        if (normalized.Length == 0 ||
+            !_personIdsByUsername.TryGetValue(normalized, out var personId))
         {
             person = default!;
             return false;
         }
 
-        return _people.TryGetValue(normalized, out person!);
+        return TryGetPerson(personId, out person);
+    }
+
+    private PersonDto ToDto(PersonState state)
+    {
+        var person = state.Person;
+        var blockedUsers = state.GetBlockedUserIds()
+            .Select(DescribeBlockedUser)
+            .OfType<BlockedUserDto>()
+            .OrderBy(blocked => blocked.Username, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return new PersonDto(
+            person.Id,
+            person.Username,
+            person.City,
+            person.Age,
+            person.Phone,
+            state.HasPendingLetter,
+            blockedUsers);
+    }
+
+    private BlockedUserDto? DescribeBlockedUser(Guid personId)
+    {
+        return _peopleById.TryGetValue(personId, out var person)
+            ? new BlockedUserDto(person.Person.Id, person.Person.Username)
+            : null;
     }
 
     private static RegistrationValidation ValidateRegistration(RegisterPersonRequest request)
@@ -332,6 +443,7 @@ public sealed class CupidRegistry
     }
 
     private sealed record RegisteredPerson(
+        Guid Id,
         string Username,
         string City,
         int Age,
@@ -343,9 +455,8 @@ public sealed class CupidRegistry
     private sealed class PersonState
     {
         private readonly object _gate = new();
-        private readonly HashSet<string> _blockedUsers = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<Guid> _blockedUserIds = new();
         private LetterDto? _pendingLetter;
-        private TaskCompletionSource<LetterDto>? _letterWaiter;
 
         public PersonState(RegisteredPerson person)
         {
@@ -367,38 +478,18 @@ public sealed class CupidRegistry
 
         public RegisteredPerson Snapshot() => Person;
 
-        public PersonDto ToDto()
+        public bool TryDeliverFrom(Guid senderId, LetterDto letter)
         {
             lock (_gate)
             {
-                return new PersonDto(
-                    Person.Username,
-                    Person.City,
-                    Person.Age,
-                    Person.Phone,
-                    _pendingLetter is not null,
-                    _blockedUsers.OrderBy(username => username, StringComparer.OrdinalIgnoreCase).ToArray());
-            }
-        }
-
-        public bool TryDeliverFrom(string senderUsername, LetterDto letter)
-        {
-            TaskCompletionSource<LetterDto>? waiter;
-
-            lock (_gate)
-            {
-                if (_pendingLetter is not null || _blockedUsers.Contains(senderUsername))
+                if (_pendingLetter is not null || _blockedUserIds.Contains(senderId))
                 {
                     return false;
                 }
 
                 _pendingLetter = letter;
-                waiter = _letterWaiter;
-                _letterWaiter = null;
+                return true;
             }
-
-            waiter?.TrySetResult(letter);
-            return true;
         }
 
         public LetterDto? GetPendingLetter()
@@ -409,57 +500,49 @@ public sealed class CupidRegistry
             }
         }
 
-        public async Task<LetterDto?> WaitForLetterAsync(TimeSpan timeout, CancellationToken cancellationToken)
-        {
-            TaskCompletionSource<LetterDto> waiter;
-
-            lock (_gate)
-            {
-                if (_pendingLetter is not null)
-                {
-                    return _pendingLetter;
-                }
-
-                _letterWaiter ??= new TaskCompletionSource<LetterDto>(TaskCreationOptions.RunContinuationsAsynchronously);
-                waiter = _letterWaiter;
-            }
-
-            var completed = await Task.WhenAny(waiter.Task, Task.Delay(timeout, cancellationToken));
-            if (completed == waiter.Task)
-            {
-                return await waiter.Task;
-            }
-
-            return null;
-        }
-
-        public bool AcknowledgeLetter()
+        public bool AcknowledgeLetter(Guid letterId, out string? error)
         {
             lock (_gate)
             {
                 if (_pendingLetter is null)
                 {
+                    error = "There is no pending letter to acknowledge.";
+                    return false;
+                }
+
+                if (_pendingLetter.Id != letterId)
+                {
+                    error = "Pending letter id does not match the acknowledgement.";
                     return false;
                 }
 
                 _pendingLetter = null;
+                error = null;
                 return true;
             }
         }
 
-        public void Block(string normalizedUsername)
+        public void Block(Guid blockedPersonId)
         {
             lock (_gate)
             {
-                _blockedUsers.Add(normalizedUsername);
+                _blockedUserIds.Add(blockedPersonId);
             }
         }
 
-        public bool HasBlocked(string normalizedUsername)
+        public bool HasBlocked(Guid personId)
         {
             lock (_gate)
             {
-                return _blockedUsers.Contains(normalizedUsername);
+                return _blockedUserIds.Contains(personId);
+            }
+        }
+
+        public IReadOnlyCollection<Guid> GetBlockedUserIds()
+        {
+            lock (_gate)
+            {
+                return _blockedUserIds.ToArray();
             }
         }
     }

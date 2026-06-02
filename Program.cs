@@ -7,31 +7,13 @@ if (args.Contains("--person", StringComparer.OrdinalIgnoreCase))
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<CupidRegistry>();
+builder.Services.AddSingleton<CupidPubSubHub>();
 builder.Services.AddHostedService<CupidBackgroundService>();
 
 var app = builder.Build();
-
-app.MapGet("/", () => Results.Ok(new
-{
-    service = "Cupidon",
-    endpoints = new[]
-    {
-        "POST /people/register",
-        "POST /people/init-single-person",
-        "GET /people/{username}/letters/next",
-        "POST /people/{username}/letters/ack",
-        "POST /people/{username}/block/{blockedUsername}",
-        "POST /cupid/tick"
-    }
-}));
+app.UseWebSockets();
 
 var people = app.MapGroup("/people");
-
-people.MapPost("/register", (RegisterPersonRequest request, CupidRegistry registry) =>
-{
-    var result = registry.InitSinglePerson(request);
-    return result.ToHttpResult();
-});
 
 people.MapPost("/init-single-person", (RegisterPersonRequest request, CupidRegistry registry) =>
 {
@@ -39,46 +21,27 @@ people.MapPost("/init-single-person", (RegisterPersonRequest request, CupidRegis
     return result.ToHttpResult();
 });
 
-people.MapGet("/{username}/letters/next", async (
-    string username,
-    int? timeoutSeconds,
+people.MapGet("/{personId:guid}/events", async (
+    Guid personId,
     CupidRegistry registry,
     HttpContext context) =>
 {
-    var timeout = TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds ?? 65, 1, 300));
-    var result = await registry.WaitForNextLetterAsync(username, timeout, context.RequestAborted);
-    return result.ToHttpResult();
+    if (!context.WebSockets.IsWebSocketRequest)
+    {
+        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        await context.Response.WriteAsJsonAsync(new ApiError("This endpoint requires a WebSocket request."));
+        return;
+    }
+
+    if (!registry.PersonExists(personId))
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        await context.Response.WriteAsJsonAsync(new ApiError("Person is not registered."));
+        return;
+    }
+
+    using var socket = await context.WebSockets.AcceptWebSocketAsync();
+    await registry.SubscribeAsync(personId, socket, context.RequestAborted);
 });
-
-people.MapPost("/{username}/letters/ack", (string username, CupidRegistry registry) =>
-{
-    var result = registry.AcknowledgeLetter(username);
-    return result.ToHttpResult();
-});
-
-people.MapPost("/{username}/block/{blockedUsername}", (
-    string username,
-    string blockedUsername,
-    CupidRegistry registry) =>
-{
-    var result = registry.BlockUser(username, blockedUsername);
-    return result.ToHttpResult();
-});
-
-people.MapGet("/{username}", (string username, CupidRegistry registry) =>
-{
-    var result = registry.GetPerson(username);
-    return result.ToHttpResult();
-});
-
-var cupid = app.MapGroup("/cupid");
-
-cupid.MapPost("/tick", (CupidRegistry registry) =>
-{
-    var result = registry.SendLetters();
-    return Results.Ok(result);
-});
-
-cupid.MapGet("/people", (CupidRegistry registry) => Results.Ok(registry.GetPeople()));
 
 app.Run();

@@ -17,7 +17,7 @@ public sealed class CupidBackgroundService : BackgroundService
         {
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                var result = _registry.SendLetters();
+                var result = await _registry.SendLettersAsync(stoppingToken);
                 _logger.LogInformation(
                     "Cupid tick delivered {DeliveredLetters}/{RegisteredPeople} letters.",
                     result.LettersDelivered,
